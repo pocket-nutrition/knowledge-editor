@@ -1,0 +1,244 @@
+name: CI
+
+# Pull requests run the cheap checks only (web build, Rust tests). The expensive part, bundling the
+# desktop app on macOS, Linux and Windows, runs only after a merge to main, where it also publishes a
+# CalVer release (vYYYY.M.N). Contributors therefore never burn bundle minutes, and nothing is
+# published from a pull request.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Tauri's Linux build dependencies, see https://v2.tauri.app/start/prerequisites/#linux
+  LINUX_DEPS: >-
+    libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev
+    libayatana-appindicator3-dev librsvg2-dev patchelf
+
+jobs:
+  web:
+    name: Web build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # `build` is `tsc && vite build`, so this is also the type check. The package defines no lint or
+      # test script, so there is nothing else to run here.
+      - run: npm run build
+
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Tauri system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # tauri::generate_context! refuses to compile when frontendDist (../dist) does not exist. The
+      # Rust checks do not need the real frontend, so an empty placeholder keeps this job independent
+      # of the web job.
+      - name: Placeholder frontend
+        run: mkdir -p dist && touch dist/index.html
+
+      # Both checks below fail on the code as it stands today (cargo fmt: 5 diffs; clippy with
+      # -D warnings: 4 errors, e.g. `unnecessary_map_or`). They are advisory until that backlog is
+      # cleaned up, at which point `continue-on-error` should be removed so they gate merges.
+      - name: cargo fmt (advisory)
+        continue-on-error: true
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # The single check that branch protection requires. Skipped jobs count as passing; failed or
+  # cancelled ones do not.
+  ci-success:
+    name: ci-success
+    if: always()
+    needs: [web, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every gate to have passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "gate results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "a required job did not pass" >&2
+              exit 1
+            fi
+          done
+
+  # ── Release: main only, after every gate has passed ─────────────────────────────────────────────
+
+  # Reserves the next CalVer tag on this commit. Kept as its own job so the bundle jobs can read the
+  # version, and so a failed bundle can release the tag again (see `cleanup`).
+  version:
+    name: Reserve version
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [web, rust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.reserve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: reserve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "version=$(.github/scripts/calver-reserve.sh)" >> "$GITHUB_OUTPUT"
+
+  # Plain `tauri build` plus artifact upload rather than tauri-apps/tauri-action: it avoids handing a
+  # write-capable token to a third-party action, and only `publish` below ever needs write access.
+  bundle:
+    name: Bundle (${{ matrix.name }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-latest
+            args: --target aarch64-apple-darwin --bundles dmg
+            rust-target: aarch64-apple-darwin
+          # macos-13 is retired; macos-15-intel is the remaining Intel runner.
+          - name: macOS x64
+            os: macos-15-intel
+            args: --target x86_64-apple-darwin --bundles dmg
+            rust-target: x86_64-apple-darwin
+          # Built on 22.04 so the AppImage runs on older glibc.
+          - name: Linux x64
+            os: ubuntu-22.04
+            args: --bundles appimage,deb
+            rust-target: ""
+          # NSIS only. The MSI target (WiX) caps the major version at 255, so a CalVer such as
+          # 2026.11.1 cannot be packaged as an MSI.
+          - name: Windows x64
+            os: windows-latest
+            args: --bundles nsis
+            rust-target: ""
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Tauri system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
+
+      - name: Add Rust target
+        if: matrix.rust-target != ''
+        run: rustup target add ${{ matrix.rust-target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # The version is injected for this build only. tauri.conf.json and Cargo.toml keep their
+      # placeholder version, so no commit is made back to main.
+      - name: Build bundles
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: npm run tauri -- build --config "{\"version\":\"${VERSION}\"}" ${{ matrix.args }}
+
+      - name: Collect bundles
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find src-tauri/target -path '*/release/bundle/*' -type f \
+            \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*-setup.exe' \) \
+            -exec cp {} release-assets/ \;
+          ls -l release-assets
+          test -n "$(ls -A release-assets)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.os }}-${{ matrix.rust-target || 'default' }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: [version, bundle]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls -l release-assets
+          gh release create "v${VERSION}" release-assets/* \
+            --verify-tag --generate-notes --title "v${VERSION}" \
+            --notes "These binaries are not code-signed or notarised, so macOS Gatekeeper and Windows SmartScreen will warn on first launch."
+
+  # A reserved tag with no release behind it is clutter, so give the version number back when the
+  # run failed before the release existed.
+  cleanup:
+    name: Release reserved tag
+    if: always() && needs.version.result == 'success' && needs.publish.result != 'success'
+    needs: [version, bundle, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the tag unless a release was created
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "release v${VERSION} exists, keeping its tag"
+          else
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/v${VERSION}"
+          fi

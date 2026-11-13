@@ -129,3 +129,15 @@ and commit the changes to `pocket-nutrition/knowledge` yourself using your norma
 - Use the provided issue templates (bug report / feature request) under
   `.github/ISSUE_TEMPLATE/`.
 - For bugs, include your OS, Node/Rust versions, and exact steps to reproduce.
+
+## CI and releases
+
+- Every pull request runs `.github/workflows/ci.yml`. The `ci-success` check must be green before a pull
+  request can be merged, the branch must be up to date with `main`, and pull requests are squash-merged
+  so history stays linear.
+- If you contribute from a fork, the workflow waits for a maintainer to approve it. It runs with a
+  read-only token and no secrets.
+- Every commit merged to `main` is released automatically with a CalVer version, `vYYYY.M.N`: the year, the
+  month, then a counter that restarts at 1 each month (for example `v2026.11.1`). You never pick a version
+  number or edit a changelog; release notes are generated from the merged pull requests.
+- A release attaches unsigned installers for macOS, Linux and Windows. macOS will warn on first launch.
