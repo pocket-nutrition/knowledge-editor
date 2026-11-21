@@ -8,6 +8,16 @@ It reads and writes YAML files directly in a local clone of
 committed and pushed from that clone using your normal `git` workflow (this app's git
 integration is read-only, showing status only).
 
+## Download
+
+Prebuilt apps for macOS, Linux and Windows are attached to each
+[GitHub release](https://github.com/pocket-nutrition/knowledge-editor/releases/latest). They are
+not code-signed, so macOS and Windows warn you the first time you open them.
+
+The [Knowledge Editor guide](https://pocketnutrition.org/docs/contribute/knowledge-editor) explains
+how to install it, point it at the Food Dataset and propose your changes. The rest of this README
+is for building the editor yourself.
+
 ## Prerequisites
 
 | Tool | Version | Install |
